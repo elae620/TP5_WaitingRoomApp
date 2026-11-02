@@ -65,13 +65,20 @@ class QueueProvider extends ChangeNotifier {
       // Charger d'abord les données locales.
       await _refreshLocalClients();
 
-      // Récupérer les clients existants depuis Supabase.
-      await _fetchRemoteClients();
+      // L'app est utilisable dès que les données locales sont chargées.
       _isInitialized = true;
+      _isLoading = false;
+      _notifyIfAlive();
 
-      // Ne pas attendre le réseau pour démarrer l'interface.
+      // Tenter la synchronisation distante en arrière-plan
+      // (échoue silencieusement hors ligne).
+      unawaited(_fetchRemoteClients());
       _setupRealtimeSubscription();
       unawaited(syncPendingClients());
+    } catch (e) {
+      // Même en cas d'erreur, l'app reste fonctionnelle en local.
+      _isInitialized = true;
+      debugPrint('Erreur lors de l\'initialisation : $e');
     } finally {
       _isLoading = false;
       _notifyIfAlive();
