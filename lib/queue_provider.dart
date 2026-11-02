@@ -2,94 +2,248 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:uuid/uuid.dart';
 
-import 'package:waiting_room_app/models/client.dart';
-
-// Fonction permettant de simuler l'ajout pendant les tests.
-typedef InsertClient = Future<void> Function(String name);
+import 'geolocation_service.dart';
+import 'local_queue_service.dart';
 
 class QueueProvider extends ChangeNotifier {
-  // Client Supabase utilisé par l'application réelle.
+  QueueProvider({
+    LocalQueueService? localDb,
+    SupabaseClient? supabase,
+    GeolocationService? geoService,
+  }) : _localDb = localDb ?? LocalQueueService(),
+       _supabase = supabase ?? Supabase.instance.client,
+       _geoService = geoService ?? GeolocationService(),
+       _insertClientForTesting = null;
+
+  // Constructeur réservé aux tests unitaires.
+  QueueProvider.forTesting({
+    required Future<void> Function(String name) insertClient,
+  }) : _localDb = null,
+       _supabase = null,
+       _geoService = null,
+       _insertClientForTesting = insertClient;
+
+  // Constructeur réservé aux tests de géolocalisation.
+  QueueProvider.forTestingWithServices({
+    required LocalQueueService localDb,
+    required GeolocationService geoService,
+  }) : _localDb = localDb,
+       _supabase = null,
+       _geoService = geoService,
+       _insertClientForTesting = null;
+
+  final LocalQueueService? _localDb;
   final SupabaseClient? _supabase;
+  final GeolocationService? _geoService;
 
-  // Fonction utilisée uniquement pendant les tests.
-  final InsertClient? _testInsertClient;
+  final Future<void> Function(String name)? _insertClientForTesting;
 
-  final List<Client> _clients = [];
+  List<Map<String, dynamic>> _clients = [];
 
-  List<Client> get clients => List.unmodifiable(_clients);
+  List<Map<String, dynamic>> get clients => List.unmodifiable(_clients);
+
+  bool _isInitialized = false;
+  bool _isLoading = false;
+  bool _isSyncing = false;
+  bool _isDisposed = false;
+
+  bool get isInitialized => _isInitialized;
+  bool get isLoading => _isLoading;
+  bool get isSyncing => _isSyncing;
 
   StreamSubscription<List<Map<String, dynamic>>>? _subscription;
 
-  // Constructeur normal : utilisé par l'application Flutter.
-  QueueProvider()
-    : _supabase = Supabase.instance.client,
-      _testInsertClient = null {
-    _listenToClients();
+  Future<void> initialize() async {
+    if (_isInitialized || _isLoading || _isDisposed) return;
+
+    _isLoading = true;
+    _notifyIfAlive();
+
+    try {
+      // Charger d'abord les données locales.
+      await _refreshLocalClients();
+
+      // Récupérer les clients existants depuis Supabase.
+      await _fetchRemoteClients();
+      _isInitialized = true;
+
+      // Ne pas attendre le réseau pour démarrer l'interface.
+      _setupRealtimeSubscription();
+      unawaited(syncPendingClients());
+    } finally {
+      _isLoading = false;
+      _notifyIfAlive();
+    }
   }
 
-  // Constructeur spécial pour les tests unitaires.
-  // Il ne nécessite aucune connexion à Supabase.
-  QueueProvider.forTesting({required InsertClient insertClient})
-    : _supabase = null,
-      _testInsertClient = insertClient;
+  Future<void> _fetchRemoteClients() async {
+    final db = _localDb;
+    final remote = _supabase;
+    if (db == null || remote == null || _isDisposed) return;
 
-  // Recevoir les données initiales et les changements en temps réel.
-  void _listenToClients() {
-    _subscription = _supabase!
+    try {
+      final rows = await remote.from('clients').select();
+      debugPrint('CLIENTS RECUPERES : $rows');
+
+      for (final row in rows) {
+        await db.insertClientLocally({...row, 'is_synced': 1});
+      }
+
+      await _refreshLocalClients();
+    } catch (e) {
+      debugPrint('ERREUR SUPABASE : $e');
+    }
+  }
+
+  Future<void> _refreshLocalClients() async {
+    final db = _localDb;
+    if (db == null || _isDisposed) return;
+
+    _clients = await db.getClients();
+    _notifyIfAlive();
+  }
+
+  Future<void> addClient(String name) async {
+    final trimmedName = name.trim();
+
+    if (trimmedName.isEmpty) return;
+
+    // Compatibilité avec les anciens tests unitaires.
+    final testInsert = _insertClientForTesting;
+    if (testInsert != null) {
+      await testInsert(trimmedName);
+      return;
+    }
+
+    // Récupérer la position GPS.
+    final position = await _geoService?.getCurrentPosition();
+
+    final db = _localDb!;
+
+    final client = <String, dynamic>{
+      'id': const Uuid().v4(),
+      'name': trimmedName,
+      'lat': position?.latitude,
+      'lng': position?.longitude,
+      'created_at': DateTime.now().toUtc().toIso8601String(),
+      'is_synced': 0,
+    };
+
+    // Enregistrer le client dans SQLite.
+    await db.insertClientLocally(client);
+    await _refreshLocalClients();
+
+    // Synchroniser avec Supabase en arrière-plan.
+    unawaited(syncPendingClients());
+  }
+
+  Future<void> syncPendingClients() async {
+    if (_isSyncing || _isDisposed) return;
+
+    final db = _localDb;
+    final remote = _supabase;
+
+    // Le constructeur de test n'utilise aucun service distant.
+    if (db == null || remote == null) return;
+
+    _isSyncing = true;
+    _notifyIfAlive();
+
+    try {
+      final pending = await db.getUnsyncedClients();
+
+      for (final client in pending) {
+        try {
+          final remoteClient = Map<String, dynamic>.from(client)
+            ..remove('is_synced')
+            ..remove('id');
+
+          await remote.from('clients').insert(remoteClient);
+
+          await db.markClientAsSynced(client['id'].toString());
+        } catch (error) {
+          debugPrint(
+            'Échec de synchronisation du client '
+            '${client['id']}: $error',
+          );
+        }
+      }
+
+      await _refreshLocalClients();
+    } catch (error) {
+      debugPrint('Erreur de synchronisation : $error');
+    } finally {
+      _isSyncing = false;
+      _notifyIfAlive();
+    }
+  }
+
+  void _setupRealtimeSubscription() {
+    final remote = _supabase;
+
+    if (remote == null || _subscription != null || _isDisposed) {
+      return;
+    }
+
+    _subscription = remote
         .from('clients')
         .stream(primaryKey: ['id'])
-        .order('created_at')
         .listen(
-          (data) {
-            _clients
-              ..clear()
-              ..addAll(data.map((row) => Client.fromMap(row)));
+          (rows) async {
+            final db = _localDb;
+            if (db == null || _isDisposed) return;
 
-            notifyListeners();
+            try {
+              for (final row in rows) {
+                await db.insertClientLocally({...row, 'is_synced': 1});
+              }
+
+              await _refreshLocalClients();
+            } catch (error) {
+              debugPrint('Erreur Realtime : $error');
+            }
           },
-          onError: (error) {
-            debugPrint('Erreur de synchronisation Supabase : $error');
+          onError: (Object error) {
+            debugPrint('Erreur du flux Realtime : $error');
           },
         );
   }
 
-  // Ajouter un client dans la base de données.
-  Future<void> addClient(String name) async {
-    final trimmedName = name.trim();
-
-    if (trimmedName.isEmpty) {
-      return;
-    }
-
-    // Pendant les tests, utiliser la fonction simulée.
-    if (_testInsertClient != null) {
-      await _testInsertClient(trimmedName);
-      return;
-    }
-
-    // Dans l'application réelle, enregistrer dans Supabase.
-    await _supabase!.from('clients').insert({'name': trimmedName});
-  }
-
-  // Supprimer un client à partir de son identifiant.
   Future<void> removeClient(String id) async {
-    await _supabase!.from('clients').delete().eq('id', id);
+    final db = _localDb;
+    final remote = _supabase;
+
+    if (db == null || remote == null) return;
+
+    await db.deleteClientLocally(id);
+    await _refreshLocalClients();
+
+    try {
+      await remote.from('clients').delete().eq('id', id);
+    } catch (error) {
+      debugPrint('Échec de suppression distante : $error');
+    }
   }
 
-  // Faire passer le client suivant.
   Future<void> nextClient() async {
-    if (_clients.isEmpty) {
-      return;
-    }
+    if (_clients.isEmpty) return;
 
     final firstClient = _clients.first;
-    await removeClient(firstClient.id);
+    await removeClient(firstClient['id'] as String);
+  }
+
+  void _notifyIfAlive() {
+    if (!_isDisposed) {
+      notifyListeners();
+    }
   }
 
   @override
   void dispose() {
-    _subscription?.cancel();
+    _isDisposed = true;
+    unawaited(_subscription?.cancel() ?? Future<void>.value());
     super.dispose();
   }
 }

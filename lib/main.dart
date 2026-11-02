@@ -1,6 +1,8 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:provider/provider.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'package:waiting_room_app/queue_provider.dart';
@@ -8,10 +10,8 @@ import 'package:waiting_room_app/queue_provider.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // 1. Charger les variables du fichier .env
   await dotenv.load(fileName: '.env');
 
-  // 2. Lire les informations de connexion
   final supabaseUrl = dotenv.env['SUPABASE_URL'];
   final supabaseKey = dotenv.env['SUPABASE_ANON_KEY'];
 
@@ -20,14 +20,13 @@ Future<void> main() async {
       supabaseKey == null ||
       supabaseKey.isEmpty) {
     throw Exception(
-      'Configuration Supabase manquante. Vérifiez le fichier .env.',
+      'Configuration Supabase manquante. '
+      'Vérifiez le fichier .env.',
     );
   }
 
-  // 3. Initialiser Supabase
   await Supabase.initialize(url: supabaseUrl, publishableKey: supabaseKey);
 
-  // 4. Lancer l'application
   runApp(const WaitingRoomApp());
 }
 
@@ -36,8 +35,12 @@ class WaitingRoomApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return ChangeNotifierProvider(
-      create: (_) => QueueProvider(),
+    return ChangeNotifierProvider<QueueProvider>(
+      create: (_) {
+        final provider = QueueProvider();
+        unawaited(provider.initialize());
+        return provider;
+      },
       child: const MaterialApp(
         debugShowCheckedModeBanner: false,
         home: WaitingRoomScreen(),
@@ -74,18 +77,21 @@ class _WaitingRoomScreenState extends State<WaitingRoomScreen> {
 
     try {
       await context.read<QueueProvider>().addClient(name);
+
+      if (!mounted) return;
       _controller.clear();
-    } catch (e) {
+    } catch (error) {
       if (!mounted) return;
 
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('Erreur lors de l’ajout : $e')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Erreur lors de l’ajout : $error')),
+      );
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    final queueProvider = context.watch<QueueProvider>();
+    final provider = context.watch<QueueProvider>();
 
     return Scaffold(
       appBar: AppBar(
@@ -94,10 +100,9 @@ class _WaitingRoomScreenState extends State<WaitingRoomScreen> {
         foregroundColor: Colors.white,
       ),
       body: Padding(
-        padding: const EdgeInsets.all(16.0),
+        padding: const EdgeInsets.all(16),
         child: Column(
           children: [
-            // Champ de saisie et bouton Add
             Row(
               children: [
                 Expanded(
@@ -115,22 +120,32 @@ class _WaitingRoomScreenState extends State<WaitingRoomScreen> {
               ],
             ),
             const SizedBox(height: 16),
-
-            // Nombre de clients en attente
             Text(
-              'Clients in Queue: ${queueProvider.clients.length}',
+              'Clients in Queue: ${provider.clients.length}',
               style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
             ),
+            if (provider.isLoading) const LinearProgressIndicator(),
             const SizedBox(height: 8),
-
-            // Liste des clients
             Expanded(
-              child: queueProvider.clients.isEmpty
+              child: provider.clients.isEmpty
                   ? const Center(child: Text('No one in queue yet...'))
                   : ListView.builder(
-                      itemCount: queueProvider.clients.length,
+                      itemCount: provider.clients.length,
                       itemBuilder: (context, index) {
-                        final client = queueProvider.clients[index];
+                        final client = provider.clients[index];
+                        final name = client['name'] as String;
+                        final id = client['id'].toString();
+                        final createdAt = client['created_at'] as String;
+
+                        final date = DateTime.parse(createdAt).toLocal();
+
+                        final lat = client['lat'] as num?;
+                        final lng = client['lng'] as num?;
+
+                        final locationText = lat != null && lng != null
+                            ? '📍 ${lat.toStringAsFixed(4)}, '
+                                  '${lng.toStringAsFixed(4)}'
+                            : '📍 Location not captured';
 
                         return Card(
                           child: ListTile(
@@ -138,10 +153,14 @@ class _WaitingRoomScreenState extends State<WaitingRoomScreen> {
                               Icons.person,
                               color: Colors.indigo,
                             ),
-                            title: Text(client.name),
+                            title: Text(name),
                             subtitle: Text(
-                              client.createdAt.toLocal().toString(),
+                              client['lat'] == null
+                                  ? '📍 Location not captured'
+                                  : '📍 ${client['lat'].toStringAsFixed(4)}, '
+                                        '${client['lng'].toStringAsFixed(4)}',
                             ),
+                            isThreeLine: true,
                             trailing: IconButton(
                               icon: const Icon(Icons.delete, color: Colors.red),
                               tooltip: 'Remove client',
@@ -149,14 +168,15 @@ class _WaitingRoomScreenState extends State<WaitingRoomScreen> {
                                 try {
                                   await context
                                       .read<QueueProvider>()
-                                      .removeClient(client.id);
-                                } catch (e) {
+                                      .removeClient(id);
+                                } catch (error) {
                                   if (!context.mounted) return;
 
                                   ScaffoldMessenger.of(context).showSnackBar(
                                     SnackBar(
                                       content: Text(
-                                        'Erreur lors de la suppression : $e',
+                                        'Erreur lors de la '
+                                        'suppression : $error',
                                       ),
                                     ),
                                   );
@@ -171,21 +191,19 @@ class _WaitingRoomScreenState extends State<WaitingRoomScreen> {
           ],
         ),
       ),
-
-      // Passer au client suivant
       floatingActionButton: FloatingActionButton(
         key: const Key('nextClientButton'),
+        tooltip: 'Next Client',
         onPressed: () async {
           try {
             await context.read<QueueProvider>().nextClient();
-          } catch (e) {
+          } catch (error) {
             if (!context.mounted) return;
 
             ScaffoldMessenger.of(context)
-                .showSnackBar(SnackBar(content: Text('Erreur : $e')));
+                .showSnackBar(SnackBar(content: Text('Erreur : $error')));
           }
         },
-        tooltip: 'Next Client',
         child: const Icon(Icons.skip_next),
       ),
     );
