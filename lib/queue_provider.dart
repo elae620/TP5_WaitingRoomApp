@@ -13,7 +13,7 @@ class QueueProvider extends ChangeNotifier {
     SupabaseClient? supabase,
     GeolocationService? geoService,
   }) : _localDb = localDb ?? LocalQueueService(),
-       _supabase = supabase ?? Supabase.instance.client,
+       _supabase = supabase,
        _geoService = geoService ?? GeolocationService(),
        _insertClientForTesting = null;
 

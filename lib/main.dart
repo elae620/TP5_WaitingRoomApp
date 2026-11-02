@@ -25,19 +25,29 @@ Future<void> main() async {
     );
   }
 
-  await Supabase.initialize(url: supabaseUrl, publishableKey: supabaseKey);
+  bool supabaseAvailable = false;
+  try {
+    await Supabase.initialize(url: supabaseUrl, publishableKey: supabaseKey);
+    supabaseAvailable = true;
+  } catch (e) {
+    debugPrint('Supabase non disponible (mode hors ligne) : $e');
+  }
 
-  runApp(const WaitingRoomApp());
+  runApp(WaitingRoomApp(supabaseAvailable: supabaseAvailable));
 }
 
 class WaitingRoomApp extends StatelessWidget {
-  const WaitingRoomApp({super.key});
+  const WaitingRoomApp({super.key, this.supabaseAvailable = true});
+
+  final bool supabaseAvailable;
 
   @override
   Widget build(BuildContext context) {
     return ChangeNotifierProvider<QueueProvider>(
       create: (_) {
-        final provider = QueueProvider();
+        final provider = QueueProvider(
+          supabase: supabaseAvailable ? Supabase.instance.client : null,
+        );
         unawaited(provider.initialize());
         return provider;
       },
